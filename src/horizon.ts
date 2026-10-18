@@ -1,5 +1,6 @@
 import { defaultCache, SimpleCache } from './cache';
 import { logger, redactHorizonUrl, redactString, LogContext } from './logger';
+import { RateBudgetTracker, RateBudgetExhaustedError } from './resilience';
 export interface HorizonBalanceNative {
   balance: string;
   asset_type: 'native';
@@ -84,6 +85,9 @@ export interface FetchAccountOptions {
   cacheTtlMs?: number;
   cache?: SimpleCache;
   fetchFn?: FetchLike;
+  rateBudgetTracker?: RateBudgetTracker;
+  /** Optional AbortSignal to cancel the request early. */
+  signal?: AbortSignal;
 }
 
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -188,6 +192,7 @@ async function fetchAccountOnce(
   timeoutMs: number,
   maxRetries: number,
   endpointKind: 'primary' | 'fallback',
+  externalSignal?: AbortSignal,
 ): Promise<FetchOnceResult> {
   const normalizedHorizonUrl = normalizeHorizonUrl(targetHorizonUrl);
   const url = `${normalizedHorizonUrl}/accounts/${stellarAddress}`;
@@ -200,6 +205,16 @@ async function fetchAccountOnce(
     const requestStartedAt = Date.now();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    // If external signal is provided, abort our controller when it aborts
+    const onExternalAbort = () => controller.abort();
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        clearTimeout(timer);
+        throw new HorizonError('Horizon request aborted', 499, false);
+      }
+      externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+    }
 
     logger.debug('Horizon fetch start', safeHorizonContext({
       component: 'horizon',
@@ -392,6 +407,9 @@ async function fetchAccountOnce(
       throw lastError;
     } finally {
       clearTimeout(timer);
+      if (externalSignal) {
+        externalSignal.removeEventListener('abort', onExternalAbort);
+      }
     }
   }
 
@@ -477,6 +495,11 @@ export async function fetchAccount(
     }));
   }
 
+  // Consume rate budget for the primary request (after cache miss)
+  if (options.rateBudgetTracker) {
+    options.rateBudgetTracker.recordRequest();
+  }
+
   let primaryError: HorizonError | undefined;
 
   try {
@@ -487,6 +510,7 @@ export async function fetchAccount(
       timeoutMs,
       maxRetries,
       'primary',
+      options.signal,
     );
 
     if (cachingEnabled) {
@@ -533,6 +557,11 @@ export async function fetchAccount(
     primaryErrorMessage: primaryError ? redactString(primaryError.message) : undefined,
   }));
 
+  // Consume rate budget for the fallback request
+  if (options.rateBudgetTracker) {
+    options.rateBudgetTracker.recordRequest();
+  }
+
   try {
     const fallbackResult = await fetchAccountOnce(
       fetch,
@@ -541,6 +570,7 @@ export async function fetchAccount(
       timeoutMs,
       maxRetries,
       'fallback',
+      options.signal,
     );
 
     if (cachingEnabled) {
